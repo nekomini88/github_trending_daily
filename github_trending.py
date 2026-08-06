@@ -235,45 +235,57 @@ def format_stars(count_str):
         return count_str
 
 
-def build_message(repos, since="daily"):
-    """Format trending repos into push message — 原文+翻译双版本"""
+def build_message(repos, since="daily", translations=None):
+    """Format trending repos into push message — 中文描述+点评
+    translations: {repo_full_name: {cn_desc, comment}} 由 translator.translate_repos() 生成；
+    为空则回退 translate_desc 关键词替换。
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     period_map = {"daily": "今日", "weekly": "本周", "monthly": "本月"}
     period_label = period_map.get(since, "今日")
-    
+    translations = translations or {}
+    use_llm = bool(translations)
+
     lines = []
     lines.append(f"🔥 GitHub 热门项目 · {period_label}榜 🔥")
     lines.append(f"📅 {now}")
     lines.append("")
-    
+
     if not repos:
         lines.append("📭 暂无数据，请稍后查看")
         lines.append("🌐 https://github.com/trending")
         return "\n".join(lines)
-    
+
     # 按今日涨幅排序
     sorted_repos = sorted(repos, key=lambda r: int(r.get("today_stars", "0").replace(",", "") or "0"), reverse=True)
-    
+
     for i, repo in enumerate(sorted_repos[:20], 1):
         name = repo["name"]
         desc_raw = repo.get("description", "")
         desc_raw = desc_raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") if desc_raw else ""
-        desc_cn = translate_desc(desc_raw)
         lang = repo.get("language", "")
         total = format_stars(repo.get("total_stars", "0"))
         today = repo.get("today_stars", "")
         period = repo.get("period", period_label)
-        
+
+        # 优先 LLM 翻译；否则回退关键词替换（translations 按 repo full_name 关联）
+        tr = translations.get(name, {}) if use_llm else {}
+        if tr:
+            desc_cn = tr.get("cn_desc") or (translate_desc(desc_raw) if desc_raw else "")
+            comment = tr.get("comment") or ""
+        else:
+            desc_cn = translate_desc(desc_raw)
+            comment = ""
+
         lang_cn = LANG_CN.get(lang, lang) if lang else ""
         lang_tag = f"「{lang_cn}」" if lang_cn else ""
         lines.append(f"{i}. {name} {lang_tag}")
-        if desc_raw:
-            # 如果原文和翻译不同，两行都显示
-            if desc_cn != desc_raw:
-                lines.append(f"   📝 {desc_cn}")
-                lines.append(f"   💬 {desc_raw}")
-            else:
-                lines.append(f"   📝 {desc_raw}")
+        if desc_cn:
+            lines.append(f"   📝 {desc_cn}")
+        elif desc_raw:
+            lines.append(f"   📝 {desc_raw}")
+        if comment:
+            lines.append(f"   💡 {comment}")
         star_info = f"⭐ {total}"
         if today and today != "0" and today != "":
             today_fmt = format_stars(today)
@@ -281,13 +293,13 @@ def build_message(repos, since="daily"):
         lines.append(f"   {star_info}")
         lines.append(f"   🔗 {repo['url']}")
         lines.append("")
-    
+
     if len(repos) > 20:
         lines.append(f"... 共 {len(repos)} 个项目")
         lines.append("")
-    
+
     lines.append("🌐 https://github.com/trending")
-    
+
     return "\n".join(lines)
 
 
