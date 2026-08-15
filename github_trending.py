@@ -55,8 +55,16 @@ def fetch_trending_scrape():
     except Exception as e:
         print(f"Scrape failed: {e}", file=sys.stderr)
         return []
-    
-    import re
+
+    return parse_trending_html(html)
+
+
+def parse_trending_html(html):
+    """Parse GitHub trending page HTML into repo dicts. 纯函数（不联网）。
+
+    Used by fetch_trending_scrape; extracted so parsing can be unit-tested
+    offline with fixture HTML.
+    """
     results = []
     
     # Match repo rows - find all h2 tags with repo links
