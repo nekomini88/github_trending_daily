@@ -9,6 +9,31 @@ from datetime import datetime
 # 使用 GitHub Search API 模拟 trending（按 stars 排序近期创建/更新的仓库）
 GITHUB_SEARCH_URL = "https://api.github.com/search/repositories?q=created:>{date}+stars:>10&sort=stars&order=desc&per_page=25"
 
+# ---- 常量 ----
+MAX_TRENDING_REPOS = 25    # parse_trending_html 最多解析条数
+MAX_DESC_LENGTH = 120      # 描述最大长度（超出截断为 117 + "..."）
+DESC_ELLIPSIS = "..."      # 描述截断后缀
+MAX_MESSAGE_REPOS = 20     # build_message 最多展示条数
+
+# 周期 → 中文（build_message 的 since 参数）
+SINCE_CN = {"daily": "今日", "weekly": "本周", "monthly": "本月"}
+# 周期 → 中文（trending 页面原始英文文本）
+TRENDING_PERIOD_CN = {"today": "今日", "this week": "本周", "this month": "本月"}
+
+# ---- HTML 解析正则 ----
+# 仓库链接: /owner/repo（恰好一段斜杠，无多余路径）
+REPO_HREF_RE = re.compile(r'href="(/[^/]+/[^/\"]+)"')
+# 需要跳过的非仓库链接前缀
+SKIP_PATH_PREFIXES = ("/login", "/sponsors", "/settings")
+ARTICLE_BLOCK_RE = re.compile(r'<article[^>]*class="Box-row"[^>]*>(.*?)</article>', re.DOTALL)
+DESC_P_RE = re.compile(r'<p class="[^"]*col-9[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
+HTML_TAG_RE = re.compile(r'<[^>]+>')
+LANG_P_RE = re.compile(r'<span itemprop="programmingLanguage">(.*?)</span>')
+STARGAZERS_RE = re.compile(r'stargazers[^>]*>\s*(?:<[^>]*>)*\s*(\d[\d,]*)')
+BIG_NUM_RE = re.compile(r'>(\d[\d,]*)</')
+TODAY_STARS_RE = re.compile(r'([\d,]+)\s*stars?\s+(today|this week|this month)')
+
+
 def fetch_trending_via_search():
     """Use GitHub Search API to find trending repos (recently created, high stars)"""
     from datetime import timedelta
@@ -59,6 +84,53 @@ def fetch_trending_scrape():
     return parse_trending_html(html)
 
 
+def _extract_repo_path(block):
+    """从 article 块提取 /owner/repo 路径；跳过 login/sponsors/settings 等非仓库链接"""
+    for m in REPO_HREF_RE.findall(block):
+        # 跳过 /login, /sponsors, /settings 等
+        if m.startswith(SKIP_PATH_PREFIXES):
+            continue
+        # 必须是 owner/repo 格式
+        parts = m.strip("/").split("/")
+        if len(parts) == 2 and not parts[0].startswith(("login", "sponsors")):
+            return m
+    return ""
+
+
+def _parse_description(block):
+    """提取仓库描述：去 HTML 标签后截断到 MAX_DESC_LENGTH"""
+    desc_match = DESC_P_RE.search(block)
+    if not desc_match:
+        return ""
+    desc = HTML_TAG_RE.sub("", desc_match.group(1)).strip()
+    if len(desc) > MAX_DESC_LENGTH:
+        desc = desc[:MAX_DESC_LENGTH - len(DESC_ELLIPSIS)] + DESC_ELLIPSIS
+    return desc
+
+
+def _parse_language(block):
+    """提取编程语言"""
+    lang_match = LANG_P_RE.search(block)
+    return lang_match.group(1).strip() if lang_match else ""
+
+
+def _parse_total_stars(block):
+    """提取总 star 数：优先 stargazers 链接，回退块内大数字"""
+    star_match = STARGAZERS_RE.search(block)
+    if star_match:
+        return star_match.group(1).replace(",", "")
+    big_nums = BIG_NUM_RE.findall(block)
+    return big_nums[0].replace(",", "") if big_nums else "0"
+
+
+def _parse_today_stars(block):
+    """提取今日/本周/本月 star 增量及周期中文标签"""
+    today_match = TODAY_STARS_RE.search(block)
+    if not today_match:
+        return "", "今日"
+    return today_match.group(1).replace(",", ""), TRENDING_PERIOD_CN.get(today_match.group(2), "今日")
+
+
 def parse_trending_html(html):
     """Parse GitHub trending page HTML into repo dicts. 纯函数（不联网）。
 
@@ -66,83 +138,22 @@ def parse_trending_html(html):
     offline with fixture HTML.
     """
     results = []
-    
-    # Match repo rows - find all h2 tags with repo links
-    # Pattern: href="/owner/repo"
-    repo_pattern = re.compile(
-        r'<h2[^>]*class="[^"]*f3[^"]*"[^>]*>.*?'
-        r'href="(/[^/]+/[^/"]+)"'
-        r'.*?</h2>',
-        re.DOTALL
-    )
-    
-    # Alternative: find all repo article blocks
-    article_pattern = re.compile(
-        r'<article[^>]*class="Box-row"[^>]*>(.*?)</article>',
-        re.DOTALL
-    )
-    
-    articles = article_pattern.findall(html)
-    
-    for block in articles[:25]:
+    for block in ARTICLE_BLOCK_RE.findall(html)[:MAX_TRENDING_REPOS]:
         # Repo name: href="/owner/repo" — must have exactly one slash, no extra path
-        repo_matches = re.findall(r'href="(/[^/]+/[^/"]+)"', block)
-        repo_path = ""
-        for m in repo_matches:
-            # Skip /login, /sponsors, /settings, etc.
-            if m.startswith("/login") or m.startswith("/sponsors") or m.startswith("/settings"):
-                continue
-            # Must be owner/repo format
-            parts = m.strip("/").split("/")
-            if len(parts) == 2 and not parts[0].startswith("login") and not parts[0].startswith("sponsors"):
-                repo_path = m
-                break
-        
+        repo_path = _extract_repo_path(block)
         if not repo_path:
             continue
-        
         name = repo_path.strip("/")
-        
-        # Description
-        desc_match = re.search(r'<p class="[^"]*col-9[^"]*"[^>]*>(.*?)</p>', block, re.DOTALL)
-        desc = ""
-        if desc_match:
-            desc = re.sub(r'<[^>]+>', '', desc_match.group(1)).strip()
-            if len(desc) > 120:
-                desc = desc[:117] + "..."
-        
-        # Language
-        lang_match = re.search(r'<span itemprop="programmingLanguage">(.*?)</span>', block)
-        lang = lang_match.group(1).strip() if lang_match else ""
-        
-        # Total stars - find stargazers link, then find number in parent
-        total_stars = "0"
-        star_match = re.search(r'stargazers[^>]*>\s*(?:<[^>]*>)*\s*(\d[\d,]*)', block)
-        if not star_match:
-            # Fallback: find large numbers (likely stars/forks)
-            big_nums = re.findall(r'>(\d[\d,]*)</', block)
-            if big_nums:
-                total_stars = big_nums[0].replace(",", "")
-        else:
-            total_stars = star_match.group(1).replace(",", "")
-        
-        # Today stars
-        today_match = re.search(r'([\d,]+)\s*stars?\s+(today|this week|this month)', block)
-        today_stars = today_match.group(1).replace(",", "") if today_match else ""
-        period = {"today": "今日", "this week": "本周", "this month": "本月"}.get(
-            today_match.group(2) if today_match else "", "今日"
-        )
-        
+        today_stars, period = _parse_today_stars(block)
         results.append({
             "name": name,
             "url": f"https://github.com/{name}",
-            "description": desc,
-            "language": lang,
-            "total_stars": total_stars,
+            "description": _parse_description(block),
+            "language": _parse_language(block),
+            "total_stars": _parse_total_stars(block),
             "today_stars": today_stars,
             "period": period
         })
-    
     return results
 
 
@@ -213,6 +224,11 @@ DESC_CN = {
 }
 
 
+def _unescape_html_entities(text):
+    """还原常见 HTML 实体（&amp;/&lt;/&gt;），空值原样返回"""
+    return text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") if text else ""
+
+
 def translate_desc(desc):
     """Simple description translation — keep technical terms, translate common words"""
     if not desc:
@@ -220,13 +236,12 @@ def translate_desc(desc):
     # Don't translate Chinese descriptions
     if any('\u4e00' <= c <= '\u9fff' for c in desc):
         # Just fix HTML entities
-        return desc.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    result = desc.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return _unescape_html_entities(desc)
+    result = _unescape_html_entities(desc)
     for en, cn in sorted(DESC_CN.items(), key=lambda x: -len(x[0])):
         result = result.replace(en, cn)
     # Clean up trailing 's' after Chinese translations
-    import re as _re
-    result = _re.sub(r'([\u4e00-\u9fff])s\b', r'\1', result)
+    result = re.sub(r'([\u4e00-\u9fff])s\b', r'\1', result)
     return result
 
 
@@ -243,21 +258,67 @@ def format_stars(count_str):
         return count_str
 
 
+def _today_stars_sort_key(repo):
+    """按今日 star 数排序的 key（容忍空值/千分位）"""
+    return int(repo.get("today_stars", "0").replace(",", "") or "0")
+
+
+def _format_star_line(total, today, period):
+    """构建单条 repo 的 star 行：⭐ 总数 + 📈 今日增量"""
+    star_info = f"⭐ {total}"
+    if today and today != "0" and today != "":
+        star_info += f"  📈 +{format_stars(today)} {period}"
+    return star_info
+
+
+def _format_repo_block(index, repo, period_label, translations, use_llm):
+    """构建单条 repo 的完整消息块（多行）"""
+    name = repo["name"]
+    desc_raw = _unescape_html_entities(repo.get("description", ""))
+    lang = repo.get("language", "")
+    total = format_stars(repo.get("total_stars", "0"))
+    today = repo.get("today_stars", "")
+    period = repo.get("period", period_label)
+
+    # 优先 LLM 翻译；否则回退关键词替换（translations 按 repo full_name 关联）
+    tr = translations.get(name, {}) if use_llm else {}
+    if tr:
+        desc_cn = tr.get("cn_desc") or (translate_desc(desc_raw) if desc_raw else "")
+        comment = tr.get("comment") or ""
+    else:
+        desc_cn = translate_desc(desc_raw)
+        comment = ""
+
+    lang_cn = LANG_CN.get(lang, lang) if lang else ""
+    lang_tag = f"「{lang_cn}」" if lang_cn else ""
+    lines = [f"{index}. {name} {lang_tag}"]
+    if desc_cn:
+        lines.append(f"   📝 {desc_cn}")
+    elif desc_raw:
+        lines.append(f"   📝 {desc_raw}")
+    if comment:
+        lines.append(f"   💡 {comment}")
+    lines.append(f"   {_format_star_line(total, today, period)}")
+    lines.append(f"   🔗 {repo['url']}")
+    lines.append("")
+    return lines
+
+
 def build_message(repos, since="daily", translations=None):
     """Format trending repos into push message — 中文描述+点评
     translations: {repo_full_name: {cn_desc, comment}} 由 translator.translate_repos() 生成；
     为空则回退 translate_desc 关键词替换。
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    period_map = {"daily": "今日", "weekly": "本周", "monthly": "本月"}
-    period_label = period_map.get(since, "今日")
+    period_label = SINCE_CN.get(since, "今日")
     translations = translations or {}
     use_llm = bool(translations)
 
-    lines = []
-    lines.append(f"🔥 GitHub 热门项目 · {period_label}榜 🔥")
-    lines.append(f"📅 {now}")
-    lines.append("")
+    lines = [
+        f"🔥 GitHub 热门项目 · {period_label}榜 🔥",
+        f"📅 {now}",
+        "",
+    ]
 
     if not repos:
         lines.append("📭 暂无数据，请稍后查看")
@@ -265,44 +326,12 @@ def build_message(repos, since="daily", translations=None):
         return "\n".join(lines)
 
     # 按今日涨幅排序
-    sorted_repos = sorted(repos, key=lambda r: int(r.get("today_stars", "0").replace(",", "") or "0"), reverse=True)
+    sorted_repos = sorted(repos, key=_today_stars_sort_key, reverse=True)
 
-    for i, repo in enumerate(sorted_repos[:20], 1):
-        name = repo["name"]
-        desc_raw = repo.get("description", "")
-        desc_raw = desc_raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") if desc_raw else ""
-        lang = repo.get("language", "")
-        total = format_stars(repo.get("total_stars", "0"))
-        today = repo.get("today_stars", "")
-        period = repo.get("period", period_label)
+    for i, repo in enumerate(sorted_repos[:MAX_MESSAGE_REPOS], 1):
+        lines.extend(_format_repo_block(i, repo, period_label, translations, use_llm))
 
-        # 优先 LLM 翻译；否则回退关键词替换（translations 按 repo full_name 关联）
-        tr = translations.get(name, {}) if use_llm else {}
-        if tr:
-            desc_cn = tr.get("cn_desc") or (translate_desc(desc_raw) if desc_raw else "")
-            comment = tr.get("comment") or ""
-        else:
-            desc_cn = translate_desc(desc_raw)
-            comment = ""
-
-        lang_cn = LANG_CN.get(lang, lang) if lang else ""
-        lang_tag = f"「{lang_cn}」" if lang_cn else ""
-        lines.append(f"{i}. {name} {lang_tag}")
-        if desc_cn:
-            lines.append(f"   📝 {desc_cn}")
-        elif desc_raw:
-            lines.append(f"   📝 {desc_raw}")
-        if comment:
-            lines.append(f"   💡 {comment}")
-        star_info = f"⭐ {total}"
-        if today and today != "0" and today != "":
-            today_fmt = format_stars(today)
-            star_info += f"  📈 +{today_fmt} {period}"
-        lines.append(f"   {star_info}")
-        lines.append(f"   🔗 {repo['url']}")
-        lines.append("")
-
-    if len(repos) > 20:
+    if len(repos) > MAX_MESSAGE_REPOS:
         lines.append(f"... 共 {len(repos)} 个项目")
         lines.append("")
 
